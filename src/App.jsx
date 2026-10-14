@@ -143,6 +143,22 @@ function clearConversationFromLayout(node, conversationId) {
   return first === node.first && second === node.second ? node : { ...node, first, second };
 }
 
+function assignConversationToPane(node, paneId, conversationId) {
+  const currentLeaf = findLeaf(node, paneId);
+  const currentConversationId = currentLeaf?.conversationId || null;
+  const existingPaneId = findPaneByConversation(node, conversationId);
+
+  let next = updateLeaf(node, paneId, (leaf) => ({ ...leaf, conversationId }));
+  if (existingPaneId && existingPaneId !== paneId) {
+    next = updateLeaf(next, existingPaneId, (leaf) => ({ ...leaf, conversationId: currentConversationId }));
+  }
+  return next;
+}
+
+function isPaneControlTarget(target) {
+  return Boolean(target?.closest?.("button, input, textarea, select, option, a, [role='button']"));
+}
+
 function pruneMissingConversations(node, validConversationIds) {
   if (!node) return node;
   if (node.type === "leaf") {
@@ -1034,13 +1050,8 @@ export function App() {
   };
 
   const setPaneConversation = (paneId, conversationId) => {
-    const existingPaneId = findPaneByConversation(layout, conversationId);
-    if (existingPaneId && existingPaneId !== paneId) {
-      setFocusedPaneId(existingPaneId);
-      rpc.setActiveConversationId(conversationId);
-      return;
-    }
-    setLayout((current) => updateLeaf(current, paneId, (leaf) => ({ ...leaf, conversationId })));
+    if (!conversationId) return;
+    setLayout((current) => assignConversationToPane(current, paneId, conversationId));
     setFocusedPaneId(paneId);
     rpc.setActiveConversationId(conversationId);
   };
@@ -1288,7 +1299,8 @@ function PaneView({ node, rpc, focused, maximized, onFocus, onSplit, onClose, on
   const conversation = rpc.conversations.find((item) => item.id === conversationId);
   const paneRpc = usePaneRpc(conversationId, rpc);
 
-  const focusPane = () => {
+  const focusPane = (event) => {
+    if (isPaneControlTarget(event.target)) return;
     onFocus(node.paneId);
     if (conversationId && conversationId !== rpc.activeConversationId) rpc.setActiveConversationId(conversationId);
   };
