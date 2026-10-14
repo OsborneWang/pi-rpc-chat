@@ -7,20 +7,17 @@ import {
   CheckCircle2,
   Clock3,
   Command,
-  Cpu,
   KeyRound,
   Loader2,
   MessagesSquare,
   PanelLeftClose,
   PanelLeftOpen,
-  PanelRight,
   SendHorizontal,
   Sparkles,
-  TerminalSquare,
-  Wrench,
+  Trash2,
   X,
 } from "lucide-react";
-import { cn, formatTime } from "./lib/utils.js";
+import { cn } from "./lib/utils.js";
 
 const params = new URLSearchParams(window.location.search);
 const initialToken = params.get("token") || window.localStorage.getItem("piRpcChatToken") || "";
@@ -29,29 +26,6 @@ const initialConversationId = params.get("conversationId") || window.localStorag
 if (params.get("token")) {
   window.localStorage.setItem("piRpcChatToken", params.get("token"));
 }
-
-const eventLabels = {
-  agent_start: "任务开始",
-  agent_end: "任务轮次结束",
-  agent_settled: "任务完成",
-  turn_start: "回复开始",
-  turn_end: "回复结束",
-  message_start: "消息开始",
-  message_update: "消息更新",
-  message_end: "消息结束",
-  response: "命令响应",
-  extension_ui_request: "扩展界面请求",
-  tool_execution_start: "工具开始",
-  tool_execution_update: "工具更新",
-  tool_execution_end: "工具结束",
-  queue_update: "队列更新",
-  stderr: "错误输出",
-  error: "错误",
-  protocol: "协议错误",
-  process: "进程",
-  client: "浏览器",
-  thinking: "思考",
-};
 
 const commandLabels = {
   prompt: "发送消息",
@@ -161,6 +135,25 @@ function getOpenConversationIds(node, ids = new Set()) {
   return ids;
 }
 
+function clearConversationFromLayout(node, conversationId) {
+  if (!node || !conversationId) return node;
+  if (node.type === "leaf") return node.conversationId === conversationId ? { ...node, conversationId: null } : node;
+  const first = clearConversationFromLayout(node.first, conversationId);
+  const second = clearConversationFromLayout(node.second, conversationId);
+  return first === node.first && second === node.second ? node : { ...node, first, second };
+}
+
+function pruneMissingConversations(node, validConversationIds) {
+  if (!node) return node;
+  if (node.type === "leaf") {
+    if (!node.conversationId || validConversationIds.has(node.conversationId)) return node;
+    return { ...node, conversationId: null };
+  }
+  const first = pruneMissingConversations(node.first, validConversationIds);
+  const second = pruneMissingConversations(node.second, validConversationIds);
+  return first === node.first && second === node.second ? node : { ...node, first, second };
+}
+
 function extractMessageText(message) {
   if (typeof message?.content === "string") return message.content;
   if (!Array.isArray(message?.content)) return "";
@@ -172,6 +165,100 @@ function extractMessageText(message) {
     })
     .filter(Boolean)
     .join("\n");
+}
+
+function createPaneSystemMessage(conversationId, conversation) {
+  return {
+    id: `system-${conversationId || "empty"}`,
+    role: "system",
+    text: conversationId ? `已打开会话：${conversation?.title || conversationId}` : "请选择或创建会话。",
+  };
+}
+
+function normalizeHistoryMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+  return messages
+    .filter((message) => ["user", "assistant", "system"].includes(message?.role) && typeof message?.text === "string" && message.text.trim())
+    .map((message) => ({
+      id: String(message.id || createId(message.role || "message")),
+      role: message.role,
+      text: message.text,
+      streaming: Boolean(message.streaming),
+    }));
+}
+
+function buildPaneMessages(conversationId, conversation, historyMessages = []) {
+  const history = normalizeHistoryMessages(historyMessages);
+  return [createPaneSystemMessage(conversationId, conversation), ...history];
+}
+
+const paneMessageCache = new Map();
+const paneRunStateCache = new Map();
+const activeRunPhases = new Set(["running", "thinking", "responding", "tool", "queued"]);
+
+function getCachedPaneMessages(conversationId) {
+  return conversationId ? paneMessageCache.get(conversationId) || null : null;
+}
+
+function setCachedPaneMessages(conversationId, messages) {
+  if (!conversationId) return;
+  paneMessageCache.set(conversationId, messages.map((message) => ({ ...message })));
+}
+
+function chatMessageScore(messages = []) {
+  return messages.reduce((score, message) => {
+    if (!message || message.role === "system") return score;
+    return score + 10000 + (message.text || "").length;
+  }, 0);
+}
+
+function initialPaneMessages(conversationId, conversation) {
+  return getCachedPaneMessages(conversationId) || buildPaneMessages(conversationId, conversation);
+}
+
+function choosePaneMessages(conversationId, conversation, historyMessages) {
+  const cached = getCachedPaneMessages(conversationId);
+  const fromHistory = buildPaneMessages(conversationId, conversation, historyMessages);
+  if (!cached) return fromHistory;
+  return chatMessageScore(fromHistory) > chatMessageScore(cached) ? fromHistory : cached;
+}
+
+function createPaneRunState(conversationId) {
+  return { phase: "idle", label: conversationId ? "Pi 空闲，等待输入" : "请选择或创建会话" };
+}
+
+function getCachedPaneRunState(conversationId) {
+  return conversationId ? paneRunStateCache.get(conversationId) || null : null;
+}
+
+function setCachedPaneRunState(conversationId, runState) {
+  if (!conversationId) return;
+  paneRunStateCache.set(conversationId, { ...runState });
+}
+
+function initialPaneRunState(conversationId) {
+  return getCachedPaneRunState(conversationId) || createPaneRunState(conversationId);
+}
+
+function statusHasAgentState(status) {
+  return Object.prototype.hasOwnProperty.call(status || {}, "isAgentRunning");
+}
+
+function reconcilePaneRunState(conversationId, currentRunState, status) {
+  if (!statusHasAgentState(status)) return currentRunState || initialPaneRunState(conversationId);
+  if (status.isAgentRunning) {
+    if (currentRunState && activeRunPhases.has(currentRunState.phase)) return currentRunState;
+    return { phase: "running", label: "Pi 正在处理请求" };
+  }
+  return { phase: "idle", label: "Pi 空闲，等待输入" };
+}
+
+function findStreamingAssistantId(messages) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role === "assistant" && message.streaming) return message.id;
+  }
+  return null;
 }
 
 function summarizeRecord(record) {
@@ -507,6 +594,37 @@ function usePiRpc() {
     return body.conversation;
   };
 
+  const deleteConversation = async (conversationId) => {
+    const conversation = conversations.find((item) => item.id === conversationId);
+    const response = await fetch(`/api/conversations/${encodeURIComponent(conversationId)}`, {
+      method: "DELETE",
+      headers: token ? { "x-pi-chat-token": token } : undefined,
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      pushToast(body.error || "删除会话失败", "error");
+      return null;
+    }
+
+    const nextConversations = body.conversations || [];
+    setConversations(nextConversations);
+    if (activeConversationId === conversationId) {
+      const nextConversationId = body.activeConversationId || nextConversations[0]?.id || "";
+      if (nextConversationId) {
+        const nextConversation = nextConversations.find((item) => item.id === nextConversationId);
+        setActiveConversationIdState(nextConversationId);
+        window.localStorage.setItem("piRpcActiveConversationId", nextConversationId);
+        resetMessagesForConversation(nextConversation);
+      } else {
+        setActiveConversationIdState("");
+        window.localStorage.removeItem("piRpcActiveConversationId");
+        resetMessagesForConversation(null);
+      }
+    }
+    pushToast(`已删除会话：${conversation?.title || conversationId}`);
+    return body;
+  };
+
   const submitPrompt = (text) => {
     const content = text.trim();
     if (!content) return false;
@@ -539,6 +657,7 @@ function usePiRpc() {
     conversations,
     refreshCatalog,
     createConversation,
+    deleteConversation,
     connected,
     status,
     runState,
@@ -563,22 +682,32 @@ function usePaneRpc(conversationId, appRpc) {
   const conversation = appRpc.conversations.find((item) => item.id === conversationId);
   const [connected, setConnected] = useState(false);
   const [status, setStatus] = useState({ processRunning: false, isAgentRunning: false, workspace: "" });
-  const [runState, setRunState] = useState({ phase: "idle", label: conversationId ? "Pi 空闲，等待输入" : "请选择或创建会话" });
-  const [messages, setMessages] = useState(() => [
-    {
-      id: `system-${conversationId || "empty"}`,
-      role: "system",
-      text: conversationId ? `已打开会话：${conversation?.title || conversationId}` : "请选择或创建会话。",
-    },
-  ]);
+  const [runState, setRunState] = useState(() => initialPaneRunState(conversationId));
+  const [messages, setMessages] = useState(() => initialPaneMessages(conversationId, conversation));
   const [events, setEvents] = useState([]);
   const [toolEvents, setToolEvents] = useState([]);
   const [statuses, setStatuses] = useState({});
   const [widgets, setWidgets] = useState({});
   const [dialog, setDialog] = useState(null);
+  const messagesRef = useRef(messages);
+  const runStateRef = useRef(runState);
   const socketRef = useRef(null);
   const activeAssistantIdRef = useRef(null);
   const reconnectTimerRef = useRef(null);
+
+  const setPaneMessages = (updater) => {
+    const next = typeof updater === "function" ? updater(messagesRef.current) : updater;
+    messagesRef.current = next;
+    setCachedPaneMessages(conversationId, next);
+    setMessages(next);
+  };
+
+  const setPaneRunState = (updater) => {
+    const next = typeof updater === "function" ? updater(runStateRef.current) : updater;
+    runStateRef.current = next;
+    setCachedPaneRunState(conversationId, next);
+    setRunState(next);
+  };
 
   const addEvent = (type, detail) => {
     setEvents((list) => appendLimited(list, { id: createId("event"), at: new Date(), type, detail }));
@@ -588,13 +717,13 @@ function usePaneRpc(conversationId, appRpc) {
     if (activeAssistantIdRef.current) return activeAssistantIdRef.current;
     const id = createId("assistant");
     activeAssistantIdRef.current = id;
-    setMessages((list) => [...list, { id, role: "assistant", text: "", streaming: true }]);
+    setPaneMessages((list) => [...list, { id, role: "assistant", text: "", streaming: true }]);
     return id;
   };
 
   const updateAssistantText = (text, mode = "append") => {
     const id = ensureAssistantMessage();
-    setMessages((list) =>
+    setPaneMessages((list) =>
       list.map((message) => {
         if (message.id !== id) return message;
         const nextText = mode === "replace" ? text : `${message.text || ""}${text}`;
@@ -606,12 +735,20 @@ function usePaneRpc(conversationId, appRpc) {
   const finalizeAssistant = (text) => {
     const id = activeAssistantIdRef.current;
     if (!id) {
-      if (text.trim()) setMessages((list) => [...list, { id: createId("assistant"), role: "assistant", text }]);
+      if (text.trim()) {
+        setPaneMessages((list) => {
+          const last = list[list.length - 1];
+          if (last?.role === "assistant") {
+            return list.map((message) => (message.id === last.id ? { ...message, text, streaming: false } : message));
+          }
+          return [...list, { id: createId("assistant"), role: "assistant", text }];
+        });
+      }
       return;
     }
 
     activeAssistantIdRef.current = null;
-    setMessages((list) =>
+    setPaneMessages((list) =>
       list.flatMap((message) => {
         if (message.id !== id) return [message];
         const finalText = text.trim() ? text : message.text || "";
@@ -625,6 +762,9 @@ function usePaneRpc(conversationId, appRpc) {
     setStatus((current) => ({ ...current, ...nextStatus }));
     if (nextStatus.statuses) setStatuses(nextStatus.statuses);
     if (nextStatus.widgets) setWidgets(nextStatus.widgets);
+    if (statusHasAgentState(nextStatus)) {
+      setPaneRunState((current) => reconcilePaneRunState(conversationId, current, nextStatus));
+    }
   };
 
   const handleExtensionUi = (record) => {
@@ -665,35 +805,35 @@ function usePaneRpc(conversationId, appRpc) {
 
     if (record.type === "agent_start") {
       applyStatus({ isAgentRunning: true });
-      setRunState({ phase: "running", label: "Pi 正在处理请求" });
+      setPaneRunState({ phase: "running", label: "Pi 正在处理请求" });
     } else if (record.type === "agent_settled") {
       applyStatus({ isAgentRunning: false });
-      setRunState({ phase: "idle", label: record.aborted ? "任务已中止，可以继续输入" : "Pi 已完成，等待下一条消息" });
+      setPaneRunState({ phase: "idle", label: record.aborted ? "任务已中止，可以继续输入" : "Pi 已完成，等待下一条消息" });
       activeAssistantIdRef.current = null;
       appRpc.refreshCatalog();
     } else if (record.type === "message_update") {
       const update = record.assistantMessageEvent;
       if (update?.type === "text_delta") {
-        setRunState({ phase: "responding", label: "Pi 正在生成回复" });
+        setPaneRunState({ phase: "responding", label: "Pi 正在生成回复" });
         updateAssistantText(update.delta || "");
       } else if (update?.type === "text_end") {
         updateAssistantText(update.content || "", "replace");
       } else if (update?.type === "thinking_delta") {
-        setRunState({ phase: "thinking", label: "Pi 正在思考" });
+        setPaneRunState({ phase: "thinking", label: "Pi 正在思考" });
         addEvent("thinking", update.delta || "");
       } else if (update?.type?.startsWith("toolcall_")) {
-        setRunState({ phase: "tool", label: `Pi 正在准备工具调用${update.toolName ? `：${update.toolName}` : ""}` });
+        setPaneRunState({ phase: "tool", label: `Pi 正在准备工具调用${update.toolName ? `：${update.toolName}` : ""}` });
         addEvent(update.type, update.toolName || update.id || "工具调用");
       }
     } else if (record.type === "message_end") {
       if (record.message?.role === "assistant") finalizeAssistant(extractMessageText(record.message));
     } else if (record.type?.startsWith("tool_execution_")) {
       if (record.type === "tool_execution_start") {
-        setRunState({ phase: "tool", label: `Pi 正在执行工具：${record.toolName || "工具"}` });
+        setPaneRunState({ phase: "tool", label: `Pi 正在执行工具：${record.toolName || "工具"}` });
       } else if (record.type === "tool_execution_update") {
-        setRunState({ phase: "tool", label: `工具执行中：${record.toolName || "工具"}` });
+        setPaneRunState({ phase: "tool", label: `工具执行中：${record.toolName || "工具"}` });
       } else if (record.type === "tool_execution_end") {
-        setRunState({ phase: record.isError ? "error" : "running", label: record.isError ? `工具执行失败：${record.toolName || "工具"}` : "工具执行完成，Pi 正在整理结果" });
+        setPaneRunState({ phase: record.isError ? "error" : "running", label: record.isError ? `工具执行失败：${record.toolName || "工具"}` : "工具执行完成，Pi 正在整理结果" });
       }
       setToolEvents((list) =>
         appendLimited(
@@ -720,6 +860,11 @@ function usePaneRpc(conversationId, appRpc) {
     if (message.type === "hello") {
       appRpc.applyCatalog(message.config || {});
       applyStatus(message.status || {});
+      const nextMessages = Array.isArray(message.history)
+        ? choosePaneMessages(conversationId, conversation, message.history)
+        : initialPaneMessages(conversationId, conversation);
+      activeAssistantIdRef.current = findStreamingAssistantId(nextMessages);
+      setPaneMessages(nextMessages);
     } else if (message.type === "status") {
       applyStatus(message.status || {});
     } else if (message.type === "rpc_record") {
@@ -746,14 +891,10 @@ function usePaneRpc(conversationId, appRpc) {
     activeAssistantIdRef.current = null;
     setConnected(false);
     setStatus({ processRunning: false, isAgentRunning: false, workspace: "" });
-    setRunState({ phase: "idle", label: conversationId ? "Pi 空闲，等待输入" : "请选择或创建会话" });
-    setMessages([
-      {
-        id: `system-${conversationId || "empty"}`,
-        role: "system",
-        text: conversationId ? `已打开会话：${conversation?.title || conversationId}` : "请选择或创建会话。",
-      },
-    ]);
+    setPaneRunState(initialPaneRunState(conversationId));
+    const nextMessages = initialPaneMessages(conversationId, conversation);
+    activeAssistantIdRef.current = findStreamingAssistantId(nextMessages);
+    setPaneMessages(nextMessages);
     setEvents([]);
     setToolEvents([]);
     setStatuses({});
@@ -820,8 +961,8 @@ function usePaneRpc(conversationId, appRpc) {
     const content = text.trim();
     if (!content) return false;
     if (send({ type: "prompt", message: content })) {
-      setRunState({ phase: "queued", label: status.isAgentRunning ? "消息已排队，Pi 会在当前任务后处理" : "消息已发送，等待 Pi 接收" });
-      setMessages((list) => [...list, { id: createId("user"), role: "user", text: content }]);
+      setPaneRunState({ phase: "queued", label: status.isAgentRunning ? "消息已排队，Pi 会在当前任务后处理" : "消息已发送，等待 Pi 接收" });
+      setPaneMessages((list) => [...list, { id: createId("user"), role: "user", text: content }]);
       return true;
     }
     return false;
@@ -864,11 +1005,17 @@ export function App() {
   const [maximizedPaneId, setMaximizedPaneId] = useState(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const openConversationIds = useMemo(() => getOpenConversationIds(layout), [layout]);
+  const validConversationIds = useMemo(() => new Set(rpc.conversations.map((conversation) => conversation.id)), [rpc.conversations]);
 
   useEffect(() => {
     window.localStorage.setItem("piRpcSplitLayout", JSON.stringify(layout));
     if (!focusedPaneId || !findFirstPaneId(layout)) setFocusedPaneId(findFirstPaneId(layout));
   }, [layout, focusedPaneId]);
+
+  useEffect(() => {
+    if (!rpc.conversations.length) return;
+    setLayout((current) => pruneMissingConversations(current, validConversationIds));
+  }, [rpc.conversations.length, validConversationIds]);
 
   const splitPane = (paneId, direction) => {
     if (countLeaves(layout) >= 6) {
@@ -917,17 +1064,26 @@ export function App() {
     if (conversation) setPaneConversation(paneId, conversation.id);
   };
 
+  const deleteConversation = async (conversation) => {
+    const confirmed = window.confirm(`删除会话“${conversation.title}”？\n\n这会停止该会话的 Pi 进程，并删除本应用保存的聊天历史。`);
+    if (!confirmed) return null;
+    const result = await rpc.deleteConversation(conversation.id);
+    if (!result) return null;
+    setLayout((current) => clearConversationFromLayout(current, conversation.id));
+    return result;
+  };
+
   return (
     <div className="h-dvh overflow-hidden bg-[linear-gradient(180deg,_#f6f8f7,_#edf2f0)] text-slate-950">
       <div className="grid h-full grid-rows-[auto_minmax(0,1fr)]">
         <Header rpc={rpc} />
         <main className={cn(
-          "grid h-full min-h-0 overflow-hidden max-[1180px]:grid-rows-[minmax(0,1fr)_minmax(180px,34vh)]",
+          "grid h-full min-h-0 overflow-hidden",
           sidebarCollapsed
-            ? "grid-cols-[52px_minmax(0,1fr)_390px] max-[1180px]:grid-cols-[52px_minmax(0,1fr)]"
-            : "grid-cols-[280px_minmax(0,1fr)_390px] max-[1180px]:grid-cols-[240px_minmax(0,1fr)]",
+            ? "grid-cols-[52px_minmax(0,1fr)]"
+            : "grid-cols-[280px_minmax(0,1fr)] max-[1180px]:grid-cols-[240px_minmax(0,1fr)]",
         )}>
-          <WorkspaceSidebar rpc={rpc} collapsed={sidebarCollapsed} onToggleCollapsed={() => setSidebarCollapsed((value) => !value)} openConversationIds={openConversationIds} onOpenConversation={openConversation} />
+          <WorkspaceSidebar rpc={rpc} collapsed={sidebarCollapsed} onToggleCollapsed={() => setSidebarCollapsed((value) => !value)} openConversationIds={openConversationIds} onOpenConversation={openConversation} onDeleteConversation={deleteConversation} />
           <SplitWorkbench
             rpc={rpc}
             layout={layout}
@@ -940,9 +1096,6 @@ export function App() {
             onPaneConversation={setPaneConversation}
             onCreateConversation={createConversationForPane}
           />
-          <div className="max-[1180px]:col-span-2">
-            <SidePanel rpc={rpc} />
-          </div>
         </main>
       </div>
       <TokenDialog rpc={rpc} />
@@ -952,7 +1105,18 @@ export function App() {
   );
 }
 
-function WorkspaceSidebar({ rpc, collapsed, onToggleCollapsed, openConversationIds, onOpenConversation }) {
+function WorkspaceSidebar({ rpc, collapsed, onToggleCollapsed, openConversationIds, onOpenConversation, onDeleteConversation }) {
+  const [deletingConversationId, setDeletingConversationId] = useState(null);
+
+  const deleteConversation = async (conversation) => {
+    setDeletingConversationId(conversation.id);
+    try {
+      await onDeleteConversation(conversation);
+    } finally {
+      setDeletingConversationId(null);
+    }
+  };
+
   if (collapsed) {
     return (
       <aside className="flex min-h-0 items-start justify-center border-r border-slate-200/80 bg-[#f3f7f5] p-2">
@@ -1000,7 +1164,10 @@ function WorkspaceSidebar({ rpc, collapsed, onToggleCollapsed, openConversationI
                     conversation={conversation}
                     active={conversation.id === rpc.activeConversationId}
                     open={openConversationIds.has(conversation.id)}
+                    canDelete={rpc.conversations.length > 1}
+                    deleting={deletingConversationId === conversation.id}
                     onClick={() => onOpenConversation(conversation.id)}
+                    onDelete={() => deleteConversation(conversation)}
                   />
                 ))}
                 {!conversations.length && <div className="px-2 py-3 text-xs text-slate-400">暂无会话</div>}
@@ -1013,24 +1180,33 @@ function WorkspaceSidebar({ rpc, collapsed, onToggleCollapsed, openConversationI
   );
 }
 
-function ConversationItem({ conversation, active, open, onClick }) {
+function ConversationItem({ conversation, active, open, canDelete, deleting, onClick, onDelete }) {
   const running = conversation.runtime?.isAgentRunning || conversation.status === "running";
   const processRunning = conversation.runtime?.processRunning || conversation.status === "idle" || running;
   return (
-    <button
-      type="button"
-      onClick={onClick}
+    <div
       className={cn(
-        "flex w-full items-center gap-2 rounded-xl border px-2 py-2 text-left transition",
+        "group flex w-full items-stretch rounded-xl border text-left transition",
         active || open ? "border-sky-200 bg-sky-50 text-sky-900" : "border-transparent bg-transparent text-slate-700 hover:bg-slate-50",
       )}
     >
-      <span className={cn("size-2 shrink-0 rounded-full", running ? "bg-sky-500" : processRunning ? "bg-emerald-500" : "bg-slate-300")} />
-      <span className="min-w-0 flex-1">
-        <span className="block truncate text-sm font-medium">{conversation.title}</span>
-        <span className="block truncate text-xs text-slate-500">{open ? "已在 pane 中打开" : running ? "执行中" : processRunning ? "空闲" : "已停止"}</span>
-      </span>
-    </button>
+      <button type="button" onClick={onClick} className="flex min-w-0 flex-1 items-center gap-2 px-2 py-2">
+        <span className={cn("size-2 shrink-0 rounded-full", running ? "bg-sky-500" : processRunning ? "bg-emerald-500" : "bg-slate-300")} />
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-sm font-medium">{conversation.title}</span>
+          <span className="block truncate text-xs text-slate-500">{open ? "已在 pane 中打开" : running ? "执行中" : processRunning ? "空闲" : "已停止"}</span>
+        </span>
+      </button>
+      <button
+        type="button"
+        onClick={onDelete}
+        disabled={!canDelete || deleting}
+        title={canDelete ? `删除会话：${conversation.title}` : "至少保留一个会话"}
+        className="my-1 mr-1 grid size-8 shrink-0 place-items-center rounded-lg text-slate-400 opacity-0 transition hover:bg-rose-50 hover:text-rose-600 disabled:cursor-not-allowed disabled:opacity-30 group-hover:opacity-100 focus:opacity-100"
+      >
+        {deleting ? <Loader2 className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+      </button>
+    </div>
   );
 }
 
@@ -1399,115 +1575,6 @@ function PathToken({ value, title }) {
       {value}
     </span>
   );
-}
-
-function SidePanel({ rpc }) {
-  const statusEntries = Object.entries(rpc.statuses || {});
-  const widgetEntries = Object.values(rpc.widgets || {});
-
-  return (
-    <aside className="min-h-0 overflow-y-auto border-l border-slate-200/80 bg-[#eef4f2] p-4 text-slate-900">
-      <div className="flex flex-col gap-3">
-        <PanelCard title="运行状态" icon={Cpu}>
-          <InfoGrid items={[
-            ["Pi", rpc.status.processRunning ? "运行中" : "已停止"],
-            ["任务", rpc.status.isAgentRunning ? "执行中" : "空闲"],
-            ["PID", rpc.status.pid || "-"],
-            ["启动", formatTime(rpc.status.startedAt)],
-          ]} />
-        </PanelCard>
-
-        <PanelCard title="扩展状态" icon={PanelRight}>
-          {statusEntries.length ? <KeyValueList entries={statusEntries} /> : <EmptyText>暂无扩展状态。</EmptyText>}
-        </PanelCard>
-
-        <PanelCard title="扩展面板" icon={Sparkles}>
-          {widgetEntries.length ? <WidgetList widgets={widgetEntries} /> : <EmptyText>暂无扩展面板。</EmptyText>}
-        </PanelCard>
-
-        <PanelCard title="工具日志" icon={Wrench}>
-          {rpc.toolEvents.length ? <EventList events={rpc.toolEvents} tool /> : <EmptyText>暂无工具调用。</EmptyText>}
-        </PanelCard>
-
-        <PanelCard title="事件" icon={TerminalSquare} action={<button onClick={rpc.clearEvents} className="text-xs text-slate-500 hover:text-slate-800">清空</button>}>
-          {rpc.events.length ? <EventList events={rpc.events} /> : <EmptyText>暂无事件。</EmptyText>}
-        </PanelCard>
-      </div>
-    </aside>
-  );
-}
-
-function PanelCard({ title, icon: Icon, action, children }) {
-  return (
-    <section className="rounded-2xl border border-slate-200/90 bg-white/78 p-4 shadow-[0_10px_24px_rgba(15,23,42,0.04)] backdrop-blur-sm">
-      <div className="mb-3 flex items-center justify-between gap-3">
-        <h2 className="flex items-center gap-2 text-sm font-medium text-slate-800"><Icon className="size-4 text-cyan-600" />{title}</h2>
-        {action}
-      </div>
-      {children}
-    </section>
-  );
-}
-
-function InfoGrid({ items }) {
-  return (
-    <dl className="grid gap-2 text-sm">
-      {items.map(([key, value]) => (
-        <div key={key} className="grid grid-cols-[72px_minmax(0,1fr)] gap-3">
-          <dt className="text-slate-500">{key}</dt>
-          <dd className="break-words text-slate-700">{value}</dd>
-        </div>
-      ))}
-    </dl>
-  );
-}
-
-function KeyValueList({ entries }) {
-  return (
-    <div className="grid gap-2">
-      {entries.map(([key, value]) => (
-        <div key={key} className="rounded-xl border border-slate-200/90 bg-slate-50/80 p-3">
-          <div className="text-xs text-slate-500">{key}</div>
-          <div className="mt-1 break-words text-sm text-slate-700">{value}</div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function WidgetList({ widgets }) {
-  return (
-    <div className="grid gap-2">
-      {widgets.map((widget) => (
-        <div key={widget.key} className="rounded-xl border border-slate-200/90 bg-slate-50/80 p-3">
-          <div className="text-xs text-slate-500">{widget.key}</div>
-          <pre className="mt-2 whitespace-pre-wrap break-words text-xs leading-5 text-slate-700">{(widget.lines || []).join("\n")}</pre>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function EventList({ events, tool = false }) {
-  return (
-    <div className="max-h-64 overflow-y-auto pr-1">
-      <div className="flex flex-col-reverse gap-2">
-        {events.map((event) => (
-          <div key={event.id} className="rounded-xl border border-slate-200/90 bg-slate-50/80 p-3 text-xs">
-            <div className="flex items-center justify-between gap-2 text-slate-500">
-              <span>{tool ? event.toolName : eventLabels[event.type] || event.type}</span>
-              <span>{event.at?.toLocaleTimeString?.() || ""}</span>
-            </div>
-            <div className="mt-1 break-words text-slate-700">{tool ? event.detail : event.detail}</div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function EmptyText({ children }) {
-  return <p className="text-sm text-slate-500">{children}</p>;
 }
 
 function TokenDialog({ rpc }) {

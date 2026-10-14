@@ -15,6 +15,7 @@ const runtimeDir = path.join(__dirname, ".runtime");
 const tokenFile = path.join(runtimeDir, "token");
 const workspacesFile = path.join(runtimeDir, "workspaces.json");
 const conversationsFile = path.join(runtimeDir, "conversations.json");
+const historiesDir = path.join(runtimeDir, "histories");
 
 const DEFAULT_WORKSPACE_PATH = process.env.PI_WORKSPACE || "/WorkSpace/pmCloud_New";
 const DEFAULT_WORKSPACE_ID = "pmcloud";
@@ -114,6 +115,195 @@ function nowIso() {
 
 function makeId(prefix) {
   return `${prefix}_${crypto.randomBytes(8).toString("hex")}`;
+}
+
+function safeFileId(value) {
+  return String(value || "default").replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
+function extractMessageText(message) {
+  if (typeof message?.content === "string") return message.content;
+  if (!Array.isArray(message?.content)) return "";
+  return message.content
+    .map((block) => {
+      if (typeof block === "string") return block;
+      if (block?.type === "text") return block.text || "";
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function normalizeChatMessage(message) {
+  if (!message || !["user", "assistant", "system"].includes(message.role)) return null;
+  const text = typeof message.text === "string" ? message.text : extractMessageText(message);
+  if (!text.trim()) return null;
+  return {
+    id: String(message.id || makeId("msg")),
+    role: message.role,
+    text,
+    streaming: Boolean(message.streaming),
+    createdAt: message.createdAt || nowIso(),
+    updatedAt: message.updatedAt || nowIso(),
+  };
+}
+
+class ChatHistoryStore {
+  constructor() {
+    this.histories = new Map();
+    this.saveTimers = new Map();
+  }
+
+  historyFile(conversationId) {
+    return path.join(historiesDir, `${safeFileId(conversationId)}.json`);
+  }
+
+  async loadAll(conversations) {
+    await fs.mkdir(historiesDir, { recursive: true });
+    await Promise.all(conversations.map((conversation) => this.load(conversation.id)));
+  }
+
+  async load(conversationId) {
+    if (this.histories.has(conversationId)) return this.histories.get(conversationId);
+    let messages = [];
+    try {
+      const raw = await fs.readFile(this.historyFile(conversationId), "utf8");
+      const parsed = JSON.parse(raw);
+      messages = (Array.isArray(parsed?.messages) ? parsed.messages : [])
+        .map((message) => normalizeChatMessage({ ...message, streaming: false }))
+        .filter(Boolean);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    const history = { messages, activeAssistantId: null };
+    this.histories.set(conversationId, history);
+    return history;
+  }
+
+  get(conversationId) {
+    if (!this.histories.has(conversationId)) this.histories.set(conversationId, { messages: [], activeAssistantId: null });
+    return this.histories.get(conversationId);
+  }
+
+  snapshot(conversationId) {
+    return this.get(conversationId).messages.map((message) => ({ ...message }));
+  }
+
+  schedulePersist(conversationId) {
+    if (this.saveTimers.has(conversationId)) clearTimeout(this.saveTimers.get(conversationId));
+    const timer = setTimeout(() => {
+      this.saveTimers.delete(conversationId);
+      this.persist(conversationId).catch((error) => console.error(`保存会话历史失败：${error.message}`));
+    }, 250);
+    timer.unref?.();
+    this.saveTimers.set(conversationId, timer);
+  }
+
+  async persist(conversationId) {
+    const history = this.get(conversationId);
+    await fs.mkdir(historiesDir, { recursive: true });
+    const messages = history.messages.map((message) => ({ ...message, streaming: false }));
+    await fs.writeFile(this.historyFile(conversationId), `${JSON.stringify({ messages }, null, 2)}\n`, "utf8");
+  }
+
+  async delete(conversationId) {
+    if (this.saveTimers.has(conversationId)) {
+      clearTimeout(this.saveTimers.get(conversationId));
+      this.saveTimers.delete(conversationId);
+    }
+    this.histories.delete(conversationId);
+    await fs.rm(this.historyFile(conversationId), { force: true });
+  }
+
+  pushMessage(conversationId, message) {
+    const normalized = normalizeChatMessage(message);
+    if (!normalized) return null;
+    const history = this.get(conversationId);
+    history.messages.push(normalized);
+    if (history.messages.length > 300) history.messages.splice(0, history.messages.length - 300);
+    this.schedulePersist(conversationId);
+    return normalized;
+  }
+
+  addUserMessage(conversationId, text) {
+    return this.pushMessage(conversationId, { id: makeId("user"), role: "user", text, createdAt: nowIso(), updatedAt: nowIso() });
+  }
+
+  ensureAssistantMessage(conversationId) {
+    const history = this.get(conversationId);
+    if (history.activeAssistantId && history.messages.some((message) => message.id === history.activeAssistantId)) return history.activeAssistantId;
+    const message = {
+      id: makeId("assistant"),
+      role: "assistant",
+      text: "",
+      streaming: true,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    };
+    history.messages.push(message);
+    if (history.messages.length > 300) history.messages.splice(0, history.messages.length - 300);
+    history.activeAssistantId = message.id;
+    this.schedulePersist(conversationId);
+    return message.id;
+  }
+
+  updateAssistantText(conversationId, text, mode = "append") {
+    const assistantId = this.ensureAssistantMessage(conversationId);
+    if (!assistantId) return;
+    const history = this.get(conversationId);
+    const message = history.messages.find((item) => item.id === assistantId);
+    if (!message) return;
+    message.text = mode === "replace" ? text : `${message.text || ""}${text}`;
+    message.streaming = true;
+    message.updatedAt = nowIso();
+    this.schedulePersist(conversationId);
+  }
+
+  finalizeAssistant(conversationId, text = "") {
+    const history = this.get(conversationId);
+    const finalText = text.trim();
+    const assistantId = history.activeAssistantId;
+    if (!assistantId) {
+      const lastMessage = history.messages[history.messages.length - 1];
+      if (finalText && lastMessage?.role === "assistant") {
+        if (lastMessage.text !== finalText) {
+          lastMessage.text = finalText;
+          lastMessage.streaming = false;
+          lastMessage.updatedAt = nowIso();
+          this.schedulePersist(conversationId);
+        }
+        return;
+      }
+      const lastAssistant = [...history.messages].reverse().find((message) => message.role === "assistant");
+      if (finalText && lastAssistant?.text !== finalText) {
+        this.pushMessage(conversationId, { id: makeId("assistant"), role: "assistant", text: finalText, createdAt: nowIso(), updatedAt: nowIso() });
+      }
+      return;
+    }
+    history.activeAssistantId = null;
+    const index = history.messages.findIndex((message) => message.id === assistantId);
+    if (index === -1) return;
+    const message = history.messages[index];
+    const nextText = finalText || message.text || "";
+    if (!nextText.trim()) {
+      history.messages.splice(index, 1);
+    } else {
+      history.messages[index] = { ...message, text: nextText, streaming: false, updatedAt: nowIso() };
+    }
+    this.schedulePersist(conversationId);
+  }
+
+  recordRpcRecord(conversationId, record) {
+    if (record.type === "message_update") {
+      const update = record.assistantMessageEvent;
+      if (update?.type === "text_delta") this.updateAssistantText(conversationId, update.delta || "");
+      if (update?.type === "text_end") this.updateAssistantText(conversationId, update.content || "", "replace");
+    } else if (record.type === "message_end" && record.message?.role === "assistant") {
+      this.finalizeAssistant(conversationId, extractMessageText(record.message));
+    } else if (record.type === "agent_settled") {
+      this.finalizeAssistant(conversationId);
+    }
+  }
 }
 
 function slugifyId(value, fallbackPrefix) {
@@ -228,6 +418,17 @@ class RegistryStore {
     const conversation = this.getConversation(id);
     if (!conversation) return null;
     Object.assign(conversation, patch, { lastUsedAt: nowIso() });
+    const workspace = this.getWorkspace(conversation.workspaceId);
+    if (workspace) workspace.lastUsedAt = nowIso();
+    await this.save();
+    return conversation;
+  }
+
+  async deleteConversation(id) {
+    const index = this.conversations.findIndex((conversation) => conversation.id === id);
+    if (index === -1) return null;
+    if (this.conversations.length <= 1) throw new Error("至少保留一个会话");
+    const [conversation] = this.conversations.splice(index, 1);
     const workspace = this.getWorkspace(conversation.workspaceId);
     if (workspace) workspace.lastUsedAt = nowIso();
     await this.save();
@@ -378,6 +579,7 @@ class PiRpcBridge extends EventEmitter {
       this.emit("protocol_error", { message: error.message, line });
       return;
     }
+    this.options.historyStore?.recordRpcRecord(this.options.conversationId, record);
     this.recordRecent(record);
     this.updateStateFromRecord(record);
     if (record.type === "response" && record.id && this.pending.has(record.id)) {
@@ -484,6 +686,7 @@ class PiRpcBridge extends EventEmitter {
   }
 
   prompt(message) {
+    this.options.historyStore?.addUserMessage(this.options.conversationId, message);
     const command = { type: "prompt", message };
     if (this.isAgentRunning) command.streamingBehavior = "followUp";
     return this.sendCommand(command, 10000);
@@ -507,9 +710,10 @@ class PiRpcBridge extends EventEmitter {
 }
 
 class RuntimeRegistry extends EventEmitter {
-  constructor(store) {
+  constructor(store, historyStore) {
     super();
     this.store = store;
+    this.historyStore = historyStore;
     this.runtimes = new Map();
     this.clients = new Map();
   }
@@ -548,6 +752,7 @@ class RuntimeRegistry extends EventEmitter {
       title: conversation.title,
       workspace: workspace.path,
       piBin: config.piBin,
+      historyStore: this.historyStore,
     });
     this.runtimes.set(conversation.id, runtime);
     this.wireRuntime(conversation.id, runtime);
@@ -610,6 +815,36 @@ class RuntimeRegistry extends EventEmitter {
     return runtime;
   }
 
+  async deleteConversation(conversationId) {
+    const { conversation } = this.getConversationOrThrow(conversationId);
+    if (this.store.conversations.length <= 1) throw new Error("至少保留一个会话");
+
+    const runtime = this.runtimes.get(conversation.id);
+    if (runtime) {
+      await runtime.stopProcess();
+      runtime.removeAllListeners();
+      this.runtimes.delete(conversation.id);
+    }
+
+    const clients = this.clients.get(conversation.id);
+    if (clients) {
+      const payload = JSON.stringify({ type: "conversation_deleted", conversationId: conversation.id });
+      for (const socket of clients) {
+        if (socket.readyState === socket.OPEN) socket.send(payload);
+        socket.close(1000, "conversation deleted");
+      }
+      this.clients.delete(conversation.id);
+    }
+
+    const deleted = await this.store.deleteConversation(conversation.id);
+    await this.historyStore.delete(conversation.id);
+    return {
+      deleted,
+      activeConversationId: this.getDefaultConversationId(),
+      conversations: this.listConversations(),
+    };
+  }
+
   addClient(conversationId, ws) {
     if (!this.clients.has(conversationId)) this.clients.set(conversationId, new Set());
     this.clients.get(conversationId).add(ws);
@@ -623,6 +858,11 @@ class RuntimeRegistry extends EventEmitter {
     }
   }
 
+  conversationMessages(conversationId) {
+    this.getConversationOrThrow(conversationId);
+    return this.historyStore.snapshot(conversationId);
+  }
+
   async shutdownAll() {
     await Promise.allSettled(Array.from(this.runtimes.values()).map((runtime) => runtime.stopProcess()));
   }
@@ -630,7 +870,9 @@ class RuntimeRegistry extends EventEmitter {
 
 const store = new RegistryStore();
 await store.load();
-const registry = new RuntimeRegistry(store);
+const historyStore = new ChatHistoryStore();
+await historyStore.loadAll(store.conversations);
+const registry = new RuntimeRegistry(store, historyStore);
 
 function publicConfig(conversationId = registry.getDefaultConversationId()) {
   const conversation = store.getConversation(conversationId);
@@ -693,12 +935,33 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, { conversations });
   }
 
+  const conversationMessages = /^\/api\/conversations\/([^/]+)\/messages$/.exec(url.pathname);
+  if (req.method === "GET" && conversationMessages) {
+    try {
+      const conversationId = decodeURIComponent(conversationMessages[1]);
+      return sendJson(res, 200, { conversationId, messages: registry.conversationMessages(conversationId) });
+    } catch (error) {
+      return sendJson(res, 404, { error: error.message });
+    }
+  }
+
   if (req.method === "POST" && url.pathname === "/api/conversations") {
     try {
       const conversation = await store.createConversation(await readBodyJson(req));
       return sendJson(res, 201, { conversation: registry.conversationSnapshot(conversation) });
     } catch (error) {
       return sendJson(res, 400, { error: error.message });
+    }
+  }
+
+  const conversationDelete = /^\/api\/conversations\/([^/]+)$/.exec(url.pathname);
+  if (req.method === "DELETE" && conversationDelete) {
+    try {
+      const conversationId = decodeURIComponent(conversationDelete[1]);
+      const result = await registry.deleteConversation(conversationId);
+      return sendJson(res, 200, result);
+    } catch (error) {
+      return sendJson(res, error.message === "会话不存在" ? 404 : 400, { error: error.message });
     }
   }
 
@@ -782,7 +1045,7 @@ wss.on("connection", async (ws, req) => {
   try {
     runtime = registry.ensureRuntime(conversationId);
     registry.addClient(conversationId, ws);
-    ws.send(JSON.stringify({ type: "hello", conversationId, config: publicConfig(conversationId), status: runtime.snapshot() }));
+    ws.send(JSON.stringify({ type: "hello", conversationId, config: publicConfig(conversationId), status: runtime.snapshot(), history: registry.conversationMessages(conversationId) }));
   } catch (error) {
     ws.send(JSON.stringify({ type: "error", conversationId, error: { message: error.message } }));
     ws.close();
