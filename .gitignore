@@ -4,3 +4,6 @@ dist/
 .env
 npm-debug.log*
 *.log
+.pi-teammates/*/runs/*
+!.pi-teammates/*/runs/.gitkeep
+.worktrees/

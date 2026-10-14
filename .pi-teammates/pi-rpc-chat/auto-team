@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="/WorkSpace/pi-rpc-chat"
+TEAM_ROOT="$ROOT/.pi-teammates/pi-rpc-chat"
+RUN_ROOT="$TEAM_ROOT/runs"
+TIMEOUT_SECONDS="${PI_RPC_CHAT_TEAM_TIMEOUT:-900}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./.pi-teammates/pi-rpc-chat/auto-team <slug> <tiny|standard|major|review|qa> <task-file> [role ...]
+
+Examples:
+  ./.pi-teammates/pi-rpc-chat/auto-team link-navigation standard /tmp/task.md
+  ./.pi-teammates/pi-rpc-chat/auto-team rpc-auth major /tmp/task.md frontend-scout backend-scout reviewer qa
+
+Notes:
+  - Designed for a normal root `pi` session to call after task grading.
+  - Support agents run as short-lived read-only Pi subprocesses.
+  - Reports are written under .pi-teammates/pi-rpc-chat/runs/<slug>/<timestamp>/.
+  - The main/root agent remains responsible for code edits and final verification.
+EOF
+}
+
+if [[ $# -lt 3 ]]; then
+  usage >&2
+  exit 2
+fi
+
+SLUG="$1"
+GRADE="$2"
+TASK_FILE="$3"
+shift 3
+
+if [[ ! "$SLUG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "Invalid slug: use only letters, numbers, dot, underscore, or dash." >&2
+  exit 2
+fi
+
+if [[ ! -f "$TASK_FILE" ]]; then
+  echo "Task file not found: $TASK_FILE" >&2
+  exit 2
+fi
+
+case "$GRADE" in
+  tiny|standard|major|review|qa) ;;
+  *)
+    echo "Invalid grade: $GRADE" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+if [[ $# -gt 0 ]]; then
+  ROLES=("$@")
+else
+  case "$GRADE" in
+    tiny)
+      ROLES=()
+      ;;
+    standard)
+      ROLES=(frontend-scout backend-scout reviewer)
+      ;;
+    major)
+      ROLES=(frontend-scout backend-scout reviewer qa)
+      ;;
+    review)
+      ROLES=(reviewer)
+      ;;
+    qa)
+      ROLES=(qa)
+      ;;
+  esac
+fi
+
+if [[ ${#ROLES[@]} -eq 0 ]]; then
+  echo "No teammate roles selected for grade '$GRADE'."
+  exit 0
+fi
+
+TS="$(date +%Y%m%d-%H%M%S)"
+RUN_DIR="$RUN_ROOT/$SLUG/$TS"
+mkdir -p "$RUN_DIR"
+cp "$TASK_FILE" "$RUN_DIR/task.md"
+
+make_prompt() {
+  local role="$1"
+  local qa_note=""
+  if [[ "$role" == "qa" ]]; then
+    qa_note="- QA 角色只有在任务文件明确给出端口、PI_WORKSPACE 和认证策略时才可以启动服务；否则只输出验证计划。"
+  fi
+  cat <<EOF
+你是 pi-rpc-chat 自动协作任务中的 $role。当前主 agent 已在根目录普通 pi 会话中完成初步分级，
+现在需要你作为短生命周期只读 teammate 提供独立分析。
+
+硬性要求：
+- 项目根目录：$ROOT
+- 先阅读 $ROOT/AGENTS.md。
+- 默认只读：禁止编辑、创建、删除、格式化、暂存或提交任何产品代码文件。
+- 不要启动长期服务，除非任务文件明确要求 QA 验证。
+- 输出中文报告。
+- 报告必须包含：结论摘要、关键文件/行号、影响面、风险、建议主 agent 下一步动作。
+- 如果信息不足，明确说明缺口，不要臆造。
+$qa_note
+
+任务档位：$GRADE
+任务说明文件：$RUN_DIR/task.md
+
+请读取任务说明并完成你的角色分析。
+EOF
+}
+
+run_role() {
+  local role="$1"
+  local dir="$TEAM_ROOT/$role"
+  local out="$RUN_DIR/$role.md"
+  local log="$RUN_DIR/$role.log"
+
+  if [[ ! -f "$dir/persona.yaml" ]]; then
+    echo "Missing persona for role: $role" >"$out"
+    return 1
+  fi
+
+  local tools="read,grep,find,ls"
+  case "$role" in
+    reviewer|qa|backend-scout)
+      tools="read,grep,find,ls,bash"
+      ;;
+  esac
+
+  local prompt_file="$RUN_DIR/$role.prompt.md"
+  make_prompt "$role" >"$prompt_file"
+
+  (
+    cd "$dir"
+    timeout "$TIMEOUT_SECONDS" pi --no-session --tools "$tools" --print "$(cat "$prompt_file")"
+  ) >"$out" 2>"$log"
+}
+
+PIDS=()
+PID_ROLES=()
+for role in "${ROLES[@]}"; do
+  run_role "$role" &
+  PIDS+=("$!")
+  PID_ROLES+=("$role")
+done
+
+FAIL=0
+for i in "${!PIDS[@]}"; do
+  pid="${PIDS[$i]}"
+  role="${PID_ROLES[$i]}"
+  if wait "$pid"; then
+    printf '%s\t%s\n' "$role" "ok" >>"$RUN_DIR/status.tsv"
+  else
+    code="$?"
+    printf '%s\tfailed:%s\n' "$role" "$code" >>"$RUN_DIR/status.tsv"
+    FAIL=1
+  fi
+done
+
+cat >"$RUN_DIR/SUMMARY.md" <<EOF
+# pi-rpc-chat auto-team run
+
+- slug: $SLUG
+- grade: $GRADE
+- run_dir: $RUN_DIR
+- roles: ${ROLES[*]}
+- status: $([[ "$FAIL" -eq 0 ]] && echo ok || echo failed)
+
+## Reports
+
+$(for role in "${ROLES[@]}"; do echo "- $role: $RUN_DIR/$role.md"; done)
+
+## Logs
+
+$(for role in "${ROLES[@]}"; do echo "- $role: $RUN_DIR/$role.log"; done)
+EOF
+
+echo "$RUN_DIR"
+exit "$FAIL"

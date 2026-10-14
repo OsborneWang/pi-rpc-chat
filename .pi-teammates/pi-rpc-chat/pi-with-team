@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="/WorkSpace/pi-rpc-chat"
+TEAM_ROOT="$ROOT/.pi-teammates/pi-rpc-chat"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./.pi-teammates/pi-rpc-chat/pi-with-team <channel> [standard|major|review|qa] [--new] [--no-support]
+
+Examples:
+  ./.pi-teammates/pi-rpc-chat/pi-with-team pi-rpc-chat-demo-1 standard --new
+  ./.pi-teammates/pi-rpc-chat/pi-with-team pi-rpc-chat-risky-change major --new
+  ./.pi-teammates/pi-rpc-chat/pi-with-team pi-rpc-chat-review-only review --new
+
+Notes:
+  - Run from /WorkSpace/pi-rpc-chat or any subdirectory.
+  - The main Pi session stays in /WorkSpace/pi-rpc-chat.
+  - Support teammates run in a tmux session named pi-rpc-chat-team-<channel>.
+  - Use a unique channel per task.
+EOF
+}
+
+if [[ $# -lt 1 ]]; then
+  usage >&2
+  exit 2
+fi
+
+case "$1" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
+CHANNEL="$1"
+shift
+
+MODE="standard"
+NEW_FLAG=""
+START_SUPPORT=1
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    standard|major|review|qa)
+      MODE="$1"
+      ;;
+    --new)
+      NEW_FLAG="--team-new"
+      ;;
+    --no-support)
+      START_SUPPORT=0
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+if [[ ! "$CHANNEL" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "Invalid channel: use only letters, numbers, dot, underscore, or dash." >&2
+  exit 2
+fi
+
+case "$MODE" in
+  standard)
+    ROLES=(frontend-scout backend-scout reviewer)
+    ;;
+  major)
+    ROLES=(frontend-scout backend-scout reviewer qa)
+    ;;
+  review)
+    ROLES=(reviewer)
+    ;;
+  qa)
+    ROLES=(qa)
+    ;;
+esac
+
+SESSION="pi-rpc-chat-team-${CHANNEL}"
+SESSION="${SESSION//./-}"
+
+start_support() {
+  if [[ "$START_SUPPORT" -eq 0 ]]; then
+    return
+  fi
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "tmux is required to auto-start support teammates. Install tmux or use --no-support." >&2
+    exit 1
+  fi
+  if tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "Support tmux session already exists: $SESSION"
+    echo "Attach with: tmux attach -t $SESSION"
+    return
+  fi
+
+  local first=1
+  for role in "${ROLES[@]}"; do
+    local dir="$TEAM_ROOT/$role"
+    if [[ ! -f "$dir/persona.yaml" ]]; then
+      echo "Missing persona.yaml for role: $role" >&2
+      exit 1
+    fi
+
+    local role_new_flag=""
+    if [[ "$first" -eq 1 ]]; then
+      role_new_flag="$NEW_FLAG"
+    fi
+
+    local cmd="pi --team-channel '$CHANNEL' $role_new_flag; exec bash"
+    if [[ "$first" -eq 1 ]]; then
+      tmux new-session -d -s "$SESSION" -n "$role" -c "$dir" "$cmd"
+      first=0
+    else
+      tmux new-window -t "$SESSION" -n "$role" -c "$dir" "$cmd"
+    fi
+  done
+
+  echo "Started support teammates in tmux session: $SESSION"
+  echo "Attach with: tmux attach -t $SESSION"
+}
+
+start_support
+
+cd "$ROOT"
+exec pi --team-channel "$CHANNEL" --agent-name "pi-rpc-chat 主会话"

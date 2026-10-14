@@ -13,6 +13,14 @@ const distDir = path.join(__dirname, "dist");
 const publicDir = path.join(__dirname, "public");
 const runtimeDir = path.join(__dirname, ".runtime");
 const tokenFile = path.join(runtimeDir, "token");
+const workspacesFile = path.join(runtimeDir, "workspaces.json");
+const conversationsFile = path.join(runtimeDir, "conversations.json");
+
+const DEFAULT_WORKSPACE_PATH = process.env.PI_WORKSPACE || "/WorkSpace/pmCloud_New";
+const DEFAULT_WORKSPACE_ID = "pmcloud";
+const DEFAULT_CONVERSATION_ID = "conv_default";
+const MAX_RUNNING_RUNTIMES = Number(process.env.PI_RPC_CHAT_MAX_RUNTIMES || 4);
+const MAX_RUNNING_PER_WORKSPACE = Number(process.env.PI_RPC_CHAT_MAX_RUNTIMES_PER_WORKSPACE || 3);
 
 async function resolveToken() {
   const authEnabled = Boolean(process.env.PI_RPC_CHAT_TOKEN) || process.env.PI_RPC_CHAT_REQUIRE_TOKEN === "1";
@@ -36,7 +44,6 @@ const tokenInfo = await resolveToken();
 const config = {
   host: process.env.HOST || "0.0.0.0",
   port: Number(process.env.PORT || 3030),
-  workspace: process.env.PI_WORKSPACE || "/WorkSpace/pmCloud_New",
   piBin: process.env.PI_BIN || "pi",
   authDisabled: !tokenInfo.token,
   token: tokenInfo.token,
@@ -87,6 +94,147 @@ function sendJson(res, status, body) {
   res.end(payload);
 }
 
+async function readJsonFile(file, fallback) {
+  try {
+    return JSON.parse(await fs.readFile(file, "utf8"));
+  } catch (error) {
+    if (error.code === "ENOENT") return fallback;
+    throw error;
+  }
+}
+
+async function writeJsonFile(file, value) {
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function makeId(prefix) {
+  return `${prefix}_${crypto.randomBytes(8).toString("hex")}`;
+}
+
+function slugifyId(value, fallbackPrefix) {
+  const cleaned = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40);
+  return cleaned || makeId(fallbackPrefix);
+}
+
+async function ensureDirectory(dir) {
+  const stat = await fs.stat(dir);
+  if (!stat.isDirectory()) throw new Error(`不是目录：${dir}`);
+}
+
+class RegistryStore {
+  constructor() {
+    this.workspaces = [];
+    this.conversations = [];
+  }
+
+  async load() {
+    await fs.mkdir(runtimeDir, { recursive: true });
+    this.workspaces = await readJsonFile(workspacesFile, []);
+    this.conversations = await readJsonFile(conversationsFile, []);
+    await this.ensureDefaults();
+  }
+
+  async ensureDefaults() {
+    if (!this.workspaces.some((workspace) => workspace.id === DEFAULT_WORKSPACE_ID)) {
+      this.workspaces.push({
+        id: DEFAULT_WORKSPACE_ID,
+        name: "pmCloud 管理系统",
+        path: DEFAULT_WORKSPACE_PATH,
+        description: "默认工作区",
+        createdAt: nowIso(),
+        lastUsedAt: nowIso(),
+      });
+    }
+
+    if (!this.conversations.some((conversation) => conversation.id === DEFAULT_CONVERSATION_ID)) {
+      this.conversations.push({
+        id: DEFAULT_CONVERSATION_ID,
+        workspaceId: DEFAULT_WORKSPACE_ID,
+        title: "默认会话",
+        createdAt: nowIso(),
+        lastUsedAt: nowIso(),
+        status: "stopped",
+      });
+    }
+
+    await this.save();
+  }
+
+  async save() {
+    await writeJsonFile(workspacesFile, this.workspaces);
+    await writeJsonFile(conversationsFile, this.conversations);
+  }
+
+  getWorkspace(id) {
+    return this.workspaces.find((workspace) => workspace.id === id) || null;
+  }
+
+  getConversation(id) {
+    return this.conversations.find((conversation) => conversation.id === id) || null;
+  }
+
+  async createWorkspace(input) {
+    const workspacePath = path.resolve(String(input.path || ""));
+    await ensureDirectory(workspacePath);
+    if (!workspacePath.startsWith("/WorkSpace")) throw new Error("第一版只允许添加 /WorkSpace 下的目录");
+    if (this.workspaces.some((workspace) => workspace.path === workspacePath)) throw new Error("工作区路径已存在");
+
+    const baseId = slugifyId(input.id || input.name || path.basename(workspacePath), "ws");
+    let id = baseId;
+    let suffix = 2;
+    while (this.getWorkspace(id)) id = `${baseId}-${suffix++}`;
+
+    const workspace = {
+      id,
+      name: String(input.name || path.basename(workspacePath)),
+      path: workspacePath,
+      description: String(input.description || ""),
+      createdAt: nowIso(),
+      lastUsedAt: nowIso(),
+    };
+    this.workspaces.push(workspace);
+    await this.save();
+    return workspace;
+  }
+
+  async createConversation(input) {
+    const workspaceId = input.workspaceId || DEFAULT_WORKSPACE_ID;
+    const workspace = this.getWorkspace(workspaceId);
+    if (!workspace) throw new Error("工作区不存在");
+    const conversation = {
+      id: makeId("conv"),
+      workspaceId,
+      title: String(input.title || "新会话"),
+      createdAt: nowIso(),
+      lastUsedAt: nowIso(),
+      status: "stopped",
+    };
+    this.conversations.push(conversation);
+    await this.save();
+    return conversation;
+  }
+
+  async touchConversation(id, patch = {}) {
+    const conversation = this.getConversation(id);
+    if (!conversation) return null;
+    Object.assign(conversation, patch, { lastUsedAt: nowIso() });
+    const workspace = this.getWorkspace(conversation.workspaceId);
+    if (workspace) workspace.lastUsedAt = nowIso();
+    await this.save();
+    return conversation;
+  }
+}
+
 class PiRpcBridge extends EventEmitter {
   constructor(options) {
     super();
@@ -114,6 +262,8 @@ class PiRpcBridge extends EventEmitter {
 
   snapshot() {
     return {
+      conversationId: this.options.conversationId,
+      workspaceId: this.options.workspaceId,
       processRunning: this.processRunning,
       isAgentRunning: this.isAgentRunning,
       pid: this.child?.pid || null,
@@ -139,9 +289,10 @@ class PiRpcBridge extends EventEmitter {
     this.isAgentRunning = false;
     this.lastExit = null;
     this.lastError = null;
-    this.startedAt = new Date().toISOString();
+    this.startedAt = nowIso();
 
-    const args = ["--mode", "rpc", "--approve", "--name", "pi-rpc-chat"];
+    const sessionId = this.options.conversationId.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const args = ["--mode", "rpc", "--approve", "--session-id", sessionId, "--name", this.options.title || sessionId];
     this.child = spawn(this.options.piBin, args, {
       cwd: this.options.workspace,
       stdio: ["pipe", "pipe", "pipe"],
@@ -158,11 +309,9 @@ class PiRpcBridge extends EventEmitter {
       this.emitStatus();
     });
     this.child.on("exit", (code, signal) => {
-      this.lastExit = { code, signal, at: new Date().toISOString() };
+      this.lastExit = { code, signal, at: nowIso() };
       this.isAgentRunning = false;
-      for (const pending of this.pending.values()) {
-        pending.reject(new Error("Pi RPC process exited"));
-      }
+      for (const pending of this.pending.values()) pending.reject(new Error("Pi RPC process exited"));
       this.pending.clear();
       this.emit("process_exit", this.lastExit);
       this.emitStatus();
@@ -184,7 +333,6 @@ class PiRpcBridge extends EventEmitter {
   async stopProcess() {
     if (!this.child) return;
     const child = this.child;
-
     await new Promise((resolve) => {
       let done = false;
       const finish = () => {
@@ -211,7 +359,6 @@ class PiRpcBridge extends EventEmitter {
 
   handleStdout(chunk) {
     this.stdoutBuffer += this.decoder.write(chunk);
-
     while (true) {
       const newline = this.stdoutBuffer.indexOf("\n");
       if (newline === -1) break;
@@ -231,16 +378,13 @@ class PiRpcBridge extends EventEmitter {
       this.emit("protocol_error", { message: error.message, line });
       return;
     }
-
     this.recordRecent(record);
     this.updateStateFromRecord(record);
-
     if (record.type === "response" && record.id && this.pending.has(record.id)) {
       const pending = this.pending.get(record.id);
       this.pending.delete(record.id);
       pending.resolve(record);
     }
-
     this.emit("record", record);
     this.emitStatus();
   }
@@ -248,20 +392,19 @@ class PiRpcBridge extends EventEmitter {
   handleStderr(chunk) {
     const text = chunk.toString("utf8");
     for (const line of text.split(/\r?\n/).filter(Boolean)) {
-      this.pushLimited(this.recentStderr, { at: new Date().toISOString(), text: line }, 80);
+      this.pushLimited(this.recentStderr, { at: nowIso(), text: line }, 80);
       this.emit("stderr", line);
     }
   }
 
   recordRecent(record) {
-    const compact = { at: new Date().toISOString(), type: record.type };
+    const compact = { at: nowIso(), type: record.type };
     if (record.type === "response") compact.command = record.command;
     if (record.type === "extension_ui_request") compact.method = record.method;
     this.pushLimited(this.recentEvents, compact, 120);
-
     if (record.type?.startsWith("tool_execution_")) {
       this.pushLimited(this.recentToolEvents, {
-        at: new Date().toISOString(),
+        at: nowIso(),
         type: record.type,
         toolCallId: record.toolCallId,
         toolName: record.toolName,
@@ -274,7 +417,6 @@ class PiRpcBridge extends EventEmitter {
   updateStateFromRecord(record) {
     if (record.type === "agent_start") this.isAgentRunning = true;
     if (record.type === "agent_settled") this.isAgentRunning = false;
-
     if (record.type === "extension_ui_request") {
       if (record.method === "setStatus") {
         if (record.statusText) this.statuses.set(record.statusKey || record.id, record.statusText);
@@ -305,9 +447,7 @@ class PiRpcBridge extends EventEmitter {
   }
 
   async writeRecord(record) {
-    if (!this.processRunning || !this.child?.stdin?.writable) {
-      throw new Error("Pi RPC 进程未运行");
-    }
+    if (!this.processRunning || !this.child?.stdin?.writable) throw new Error("Pi RPC 进程未运行");
     const payload = `${JSON.stringify(record)}\n`;
     if (this.child.stdin.write(payload)) return;
     await new Promise((resolve, reject) => {
@@ -319,7 +459,6 @@ class PiRpcBridge extends EventEmitter {
   sendCommand(command, timeoutMs = 30000) {
     const id = command.id || `web-${Date.now()}-${this.nextId++}`;
     const record = { ...command, id };
-
     const promise = new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(id);
@@ -336,13 +475,11 @@ class PiRpcBridge extends EventEmitter {
         },
       });
     });
-
     this.writeRecord(record).catch((error) => {
       const pending = this.pending.get(id);
       this.pending.delete(id);
       pending?.reject(error);
     });
-
     return promise;
   }
 
@@ -369,41 +506,223 @@ class PiRpcBridge extends EventEmitter {
   }
 }
 
-const bridge = new PiRpcBridge(config);
-const clients = new Set();
-
-function broadcast(message) {
-  const payload = JSON.stringify(message);
-  for (const socket of clients) {
-    if (socket.readyState === socket.OPEN) socket.send(payload);
+class RuntimeRegistry extends EventEmitter {
+  constructor(store) {
+    super();
+    this.store = store;
+    this.runtimes = new Map();
+    this.clients = new Map();
   }
-}
 
-bridge.on("record", (record) => broadcast({ type: "rpc_record", record }));
-bridge.on("status", (status) => broadcast({ type: "status", status }));
-bridge.on("stderr", (line) => broadcast({ type: "stderr", line }));
-bridge.on("protocol_error", (error) => broadcast({ type: "protocol_error", error }));
-bridge.on("error_event", (error) => broadcast({ type: "error", error }));
-bridge.on("process_exit", (exit) => broadcast({ type: "process_exit", exit }));
+  conversationSnapshot(conversation) {
+    const runtime = this.runtimes.get(conversation.id);
+    return {
+      ...conversation,
+      runtime: runtime?.snapshot() || null,
+    };
+  }
 
-const server = http.createServer(async (req, res) => {
-  const url = parseUrl(req);
+  listConversations() {
+    return this.store.conversations.map((conversation) => this.conversationSnapshot(conversation));
+  }
 
-  if (url.pathname === "/api/config") {
-    if (!isAuthorized(req, url)) return sendJson(res, 401, { error: "未授权" });
-    return sendJson(res, 200, {
-      workspace: config.workspace,
-      port: config.port,
-      host: config.host,
-      authRequired: !config.authDisabled,
-      tokenSource: config.tokenSource,
-      status: bridge.snapshot(),
+  getDefaultConversationId() {
+    return this.store.getConversation(DEFAULT_CONVERSATION_ID)?.id || this.store.conversations[0]?.id;
+  }
+
+  getConversationOrThrow(id) {
+    const conversation = this.store.getConversation(id || this.getDefaultConversationId());
+    if (!conversation) throw new Error("会话不存在");
+    const workspace = this.store.getWorkspace(conversation.workspaceId);
+    if (!workspace) throw new Error("会话所属工作区不存在");
+    return { conversation, workspace };
+  }
+
+  ensureRuntime(conversationId) {
+    const { conversation, workspace } = this.getConversationOrThrow(conversationId);
+    if (this.runtimes.has(conversation.id)) return this.runtimes.get(conversation.id);
+
+    const runtime = new PiRpcBridge({
+      conversationId: conversation.id,
+      workspaceId: workspace.id,
+      title: conversation.title,
+      workspace: workspace.path,
+      piBin: config.piBin,
+    });
+    this.runtimes.set(conversation.id, runtime);
+    this.wireRuntime(conversation.id, runtime);
+    return runtime;
+  }
+
+  wireRuntime(conversationId, runtime) {
+    runtime.on("record", (record) => this.broadcast(conversationId, { type: "rpc_record", conversationId, record }));
+    runtime.on("status", async (status) => {
+      await this.store.touchConversation(conversationId, { status: status.processRunning ? (status.isAgentRunning ? "running" : "idle") : "stopped" });
+      this.broadcast(conversationId, { type: "status", conversationId, status });
+      this.emit("conversation_change", this.conversationSnapshot(this.store.getConversation(conversationId)));
+    });
+    runtime.on("stderr", (line) => this.broadcast(conversationId, { type: "stderr", conversationId, line }));
+    runtime.on("protocol_error", (error) => this.broadcast(conversationId, { type: "protocol_error", conversationId, error }));
+    runtime.on("error_event", (error) => this.broadcast(conversationId, { type: "error", conversationId, error }));
+    runtime.on("process_exit", async (exit) => {
+      await this.store.touchConversation(conversationId, { status: "stopped" });
+      this.broadcast(conversationId, { type: "process_exit", conversationId, exit });
+      this.emit("conversation_change", this.conversationSnapshot(this.store.getConversation(conversationId)));
     });
   }
 
-  if (url.pathname === "/api/status") {
-    if (!isAuthorized(req, url)) return sendJson(res, 401, { error: "未授权" });
-    return sendJson(res, 200, bridge.snapshot());
+  runningCounts(workspaceId) {
+    let total = 0;
+    let workspaceTotal = 0;
+    for (const [conversationId, runtime] of this.runtimes.entries()) {
+      if (!runtime.processRunning) continue;
+      total += 1;
+      const conversation = this.store.getConversation(conversationId);
+      if (conversation?.workspaceId === workspaceId) workspaceTotal += 1;
+    }
+    return { total, workspaceTotal };
+  }
+
+  async startConversation(conversationId) {
+    const { conversation, workspace } = this.getConversationOrThrow(conversationId);
+    const runtime = this.ensureRuntime(conversation.id);
+    if (!runtime.processRunning) {
+      const counts = this.runningCounts(workspace.id);
+      if (counts.total >= MAX_RUNNING_RUNTIMES) throw new Error(`运行中会话已达上限：${MAX_RUNNING_RUNTIMES}`);
+      if (counts.workspaceTotal >= MAX_RUNNING_PER_WORKSPACE) throw new Error(`该工作区运行中会话已达上限：${MAX_RUNNING_PER_WORKSPACE}`);
+    }
+    await runtime.start();
+    await this.store.touchConversation(conversation.id, { status: runtime.isAgentRunning ? "running" : "idle" });
+    return runtime;
+  }
+
+  async restartConversation(conversationId) {
+    const runtime = this.ensureRuntime(conversationId);
+    await runtime.restart();
+    return runtime;
+  }
+
+  async stopConversation(conversationId) {
+    const runtime = this.runtimes.get(conversationId);
+    if (!runtime) return null;
+    await runtime.stopProcess();
+    await this.store.touchConversation(conversationId, { status: "stopped" });
+    return runtime;
+  }
+
+  addClient(conversationId, ws) {
+    if (!this.clients.has(conversationId)) this.clients.set(conversationId, new Set());
+    this.clients.get(conversationId).add(ws);
+    ws.on("close", () => this.clients.get(conversationId)?.delete(ws));
+  }
+
+  broadcast(conversationId, message) {
+    const payload = JSON.stringify(message);
+    for (const socket of this.clients.get(conversationId) || []) {
+      if (socket.readyState === socket.OPEN) socket.send(payload);
+    }
+  }
+
+  async shutdownAll() {
+    await Promise.allSettled(Array.from(this.runtimes.values()).map((runtime) => runtime.stopProcess()));
+  }
+}
+
+const store = new RegistryStore();
+await store.load();
+const registry = new RuntimeRegistry(store);
+
+function publicConfig(conversationId = registry.getDefaultConversationId()) {
+  const conversation = store.getConversation(conversationId);
+  const workspace = conversation && store.getWorkspace(conversation.workspaceId);
+  return {
+    workspace: workspace?.path || DEFAULT_WORKSPACE_PATH,
+    activeConversationId: conversation?.id || null,
+    activeWorkspaceId: workspace?.id || null,
+    workspaces: store.workspaces,
+    conversations: registry.listConversations(),
+    port: config.port,
+    host: config.host,
+    authRequired: !config.authDisabled,
+    tokenSource: config.tokenSource,
+    limits: {
+      maxRunningRuntimes: MAX_RUNNING_RUNTIMES,
+      maxRunningPerWorkspace: MAX_RUNNING_PER_WORKSPACE,
+    },
+  };
+}
+
+async function readBodyJson(req) {
+  let body = "";
+  for await (const chunk of req) body += chunk;
+  if (!body.trim()) return {};
+  return JSON.parse(body);
+}
+
+async function handleApi(req, res, url) {
+  if (!isAuthorized(req, url)) return sendJson(res, 401, { error: "未授权" });
+
+  if (req.method === "GET" && url.pathname === "/api/config") {
+    const conversationId = url.searchParams.get("conversationId") || registry.getDefaultConversationId();
+    const runtime = registry.ensureRuntime(conversationId);
+    return sendJson(res, 200, { ...publicConfig(conversationId), status: runtime.snapshot() });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/status") {
+    const conversationId = url.searchParams.get("conversationId") || registry.getDefaultConversationId();
+    const runtime = registry.ensureRuntime(conversationId);
+    return sendJson(res, 200, runtime.snapshot());
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/workspaces") {
+    return sendJson(res, 200, { workspaces: store.workspaces });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/workspaces") {
+    try {
+      const workspace = await store.createWorkspace(await readBodyJson(req));
+      return sendJson(res, 201, { workspace });
+    } catch (error) {
+      return sendJson(res, 400, { error: error.message });
+    }
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/conversations") {
+    const workspaceId = url.searchParams.get("workspaceId");
+    const conversations = registry.listConversations().filter((conversation) => !workspaceId || conversation.workspaceId === workspaceId);
+    return sendJson(res, 200, { conversations });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/conversations") {
+    try {
+      const conversation = await store.createConversation(await readBodyJson(req));
+      return sendJson(res, 201, { conversation: registry.conversationSnapshot(conversation) });
+    } catch (error) {
+      return sendJson(res, 400, { error: error.message });
+    }
+  }
+
+  const conversationAction = /^\/api\/conversations\/([^/]+)\/(start|stop|restart)$/.exec(url.pathname);
+  if (req.method === "POST" && conversationAction) {
+    try {
+      const [, conversationId, action] = conversationAction;
+      if (action === "start") await registry.startConversation(conversationId);
+      if (action === "stop") await registry.stopConversation(conversationId);
+      if (action === "restart") await registry.restartConversation(conversationId);
+      return sendJson(res, 200, { conversation: registry.conversationSnapshot(store.getConversation(conversationId)) });
+    } catch (error) {
+      return sendJson(res, 400, { error: error.message });
+    }
+  }
+
+  return false;
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = parseUrl(req);
+  if (url.pathname.startsWith("/api/")) {
+    const handled = await handleApi(req, res, url);
+    if (handled !== false) return;
   }
 
   const rootDir = await staticRoot();
@@ -436,7 +755,7 @@ const server = http.createServer(async (req, res) => {
         res.end(index);
         return;
       } catch {
-        // Fall through to the plain 404 below.
+        // Fall through.
       }
     }
     res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
@@ -453,95 +772,87 @@ server.on("upgrade", (req, socket, head) => {
     socket.destroy();
     return;
   }
-
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit("connection", ws, req);
-  });
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
 
-wss.on("connection", (ws) => {
-  clients.add(ws);
-  ws.send(JSON.stringify({ type: "hello", config: publicConfig(), status: bridge.snapshot() }));
+wss.on("connection", async (ws, req) => {
+  const url = parseUrl(req);
+  const conversationId = url.searchParams.get("conversationId") || registry.getDefaultConversationId();
+  let runtime;
+  try {
+    runtime = registry.ensureRuntime(conversationId);
+    registry.addClient(conversationId, ws);
+    ws.send(JSON.stringify({ type: "hello", conversationId, config: publicConfig(conversationId), status: runtime.snapshot() }));
+  } catch (error) {
+    ws.send(JSON.stringify({ type: "error", conversationId, error: { message: error.message } }));
+    ws.close();
+    return;
+  }
 
   ws.on("message", async (raw) => {
     let message;
     try {
       message = JSON.parse(raw.toString("utf8"));
     } catch (error) {
-      return ws.send(JSON.stringify({ type: "error", error: { message: `JSON 格式错误：${error.message}` } }));
+      return ws.send(JSON.stringify({ type: "error", conversationId, error: { message: `JSON 格式错误：${error.message}` } }));
     }
 
     try {
       if (message.type === "prompt") {
         const text = String(message.message || "").trim();
         if (!text) throw new Error("消息内容不能为空");
-        await bridge.start();
-        const response = await bridge.prompt(text);
-        ws.send(JSON.stringify({ type: "command_response", response }));
+        await registry.startConversation(conversationId);
+        const response = await runtime.prompt(text);
+        ws.send(JSON.stringify({ type: "command_response", conversationId, response }));
       } else if (message.type === "abort") {
-        const response = await bridge.abort();
-        ws.send(JSON.stringify({ type: "command_response", response }));
+        const response = await runtime.abort();
+        ws.send(JSON.stringify({ type: "command_response", conversationId, response }));
       } else if (message.type === "restart") {
-        await bridge.restart();
-        ws.send(JSON.stringify({ type: "command_response", response: { command: "restart", success: true } }));
+        await registry.restartConversation(conversationId);
+        ws.send(JSON.stringify({ type: "command_response", conversationId, response: { command: "restart", success: true } }));
       } else if (message.type === "get_state") {
-        await bridge.start();
-        const response = await bridge.getState();
-        ws.send(JSON.stringify({ type: "command_response", response }));
+        await registry.startConversation(conversationId);
+        const response = await runtime.getState();
+        ws.send(JSON.stringify({ type: "command_response", conversationId, response }));
       } else if (message.type === "extension_ui_response") {
-        await bridge.respondToExtensionUi(message.response);
-        ws.send(JSON.stringify({ type: "command_response", response: { command: "extension_ui_response", success: true } }));
+        await runtime.respondToExtensionUi(message.response);
+        ws.send(JSON.stringify({ type: "command_response", conversationId, response: { command: "extension_ui_response", success: true } }));
       } else {
         throw new Error(`不支持的浏览器消息类型：${message.type}`);
       }
     } catch (error) {
-      ws.send(JSON.stringify({ type: "error", error: { message: error.message } }));
+      ws.send(JSON.stringify({ type: "error", conversationId, error: { message: error.message } }));
     }
   });
-
-  ws.on("close", () => clients.delete(ws));
 });
 
-function publicConfig() {
-  return {
-    workspace: config.workspace,
-    port: config.port,
-    host: config.host,
-    authRequired: !config.authDisabled,
-    tokenSource: config.tokenSource,
-  };
-}
-
 server.listen(config.port, config.host, async () => {
-  const localUrl = config.authDisabled
-    ? `http://localhost:${config.port}/`
-    : `http://localhost:${config.port}/?token=${encodeURIComponent(config.token)}`;
+  const localUrl = config.authDisabled ? `http://localhost:${config.port}/` : `http://localhost:${config.port}/?token=${encodeURIComponent(config.token)}`;
   console.log(`Pi 远程对话已监听：http://${config.host}:${config.port}`);
-  console.log(`工作区：${config.workspace}`);
+  console.log(`默认工作区：${DEFAULT_WORKSPACE_PATH}`);
   console.log(`本机打开：${localUrl}`);
   if (!config.authDisabled) {
     console.log(`Token 来源：${config.tokenSource}`);
     console.log(`Token 文件：${config.tokenFile}`);
-    console.log("在 Mac 上访问时，把上面 URL 里的 localhost 换成这台 Ubuntu 的局域网 IP。");
   } else {
     console.log("Token 校验已关闭：当前为局域网调试模式。只应在可信网络中使用。");
   }
 
   try {
-    await bridge.start();
-    await bridge.getState().catch(() => null);
+    const runtime = await registry.startConversation(DEFAULT_CONVERSATION_ID);
+    await runtime.getState().catch(() => null);
   } catch (error) {
-    console.error(`Pi RPC 进程启动失败：${error.message}`);
+    console.error(`默认 Pi RPC 进程启动失败：${error.message}`);
   }
 });
 
 process.on("SIGINT", async () => {
   console.log("正在关闭...");
-  await bridge.stopProcess();
+  await registry.shutdownAll();
   process.exit(0);
 });
 
 process.on("SIGTERM", async () => {
-  await bridge.stopProcess();
+  await registry.shutdownAll();
   process.exit(0);
 });
